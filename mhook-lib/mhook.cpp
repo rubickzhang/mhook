@@ -1,4 +1,4 @@
-//Copyright (c) 2007-2008, Marton Anka
+﻿//Copyright (c) 2007-2008, Marton Anka
 //
 //Permission is hereby granted, free of charge, to any person obtaining a 
 //copy of this software and associated documentation files (the "Software"), 
@@ -217,6 +217,89 @@ static VOID EnterCritSec() {
 static VOID LeaveCritSec() {
 	LeaveCriticalSection(&g_cs);
 }
+
+/*
+author: rubickzhang
+description:
+SkipJumps函数用于跳过指定地址的跳转指令（跳转偏移量）的函数，
+这个函数是在Hook函数中常常用到的一个工具函数。在Hook函数中，我们需要通过跳转指令
+将函数的控制权转移到Hook函数中进行处理，但是有时候函数的前面可能会有多个跳转指令，
+这会导致我们无法准确地知道函数的实际起始位置，从而无法正确地进行Hook。因此，我们
+需要一个函数来跳过这些跳转指令，以便我们找到函数的实际起始位置。
+
+逻辑：
+1、保存当前函数地址，对当前地址进行循环判断，如果是跳转指令或者间接跳转指令，则根据跳转偏移
+量来调整指针的位置；
+2、当其字节不是跳转指令或者间接跳转指令，则退出循环；
+3、返回指针指向的位置，即函数实际的起始地址；
+
+跳转指令和对应的机器码
+0xE8 CALL 后面的四个字节是地址
+0xE9 JMP 后面的四个字节是偏移
+0xEB JMP 后面的二个字节是偏移
+0xFF15 CALL 后面的四个字节是存放地址的地址
+0xFF25 JMP 后面的四个字节是存放地址的地址
+
+0x68 PUSH 后面的四个字节入栈
+0x6A PUSH 后面的一个字节入栈
+
+如下：
+0xE9：相对跳转指令（JMP），指令长度为5个字节。该指令使用32位带符号整数表示跳转偏移量，
+表示相对于跳转指令下一条指令的偏移量。
+0xEB：短跳转指令（JMP），指令长度为2个字节。该指令使用8位带符号整数表示跳转偏移量，表示相
+对于跳转指令下一条指令的偏移量。
+
+
+相对跳转指令的跳转目的地可以是当前代码段内的任意位置，也可以跳转到其他代码段。跳转偏移量
+可以是正数或者负数，正数表示向后跳转，负数表示向前跳转。短跳转指令的跳转范围比相对跳转指
+令小，只能跳转到当前代码段内的相对短的距离内。因此，短跳转指令通常用于实现短小的跳转。
+
+SkipJumps函数使用0xE9和0xEB指令来跳过跳转指令，以便找到函数的实际起始位置。
+
+ff 25  和 48 ff 25的解释：
+这两个指令都是间接绝对跳转指令，前者为x86(32位)下，后者为64位模式下的
+以64位为例,绝对跳转指令的格式为：
+48 ff 25 xx xx xx xx 
+其中48是REX前缀，用于指示使用64位寻址模式。ff 25是操作码，表示这是一条绝对跳转指令。
+xx xx xx xx是指针地址，用于指向实际的目标地址。
+
+所以综上所述，在进行x64的绝对跳转指令的跳转下，pbCode 是一个指向相对跳转指令的指针，而 
+pbCode+7 指向相对跳转指令中偏移量的位置，lOffset 是我们希望跳转到的目标相对偏移量，因此
+pbCode+7+lOffset 就是目标地址的指针。由于相对跳转指令的偏移量是相对于当前指令地址的，所以
+在计算目标地址时，需要使用当前指令的地址加上相对偏移量来得到目标地址。
+
+绝对跳转指令的代码，example:
+
+#include <stdio.h>
+
+// 定义一个函数，用于输出一条消息
+void printMessage(const char* message) {
+	printf("%s\n", message);
+}
+
+// 定义一个函数指针类型
+typedef void (*PrintMessageFunc)(const char*);
+
+int main() {
+	// 定义一个函数指针，并初始化为 printMessage 函数的地址
+	PrintMessageFunc pFunc = printMessage;
+
+	// 使用绝对跳转指令，跳转到 pFunc 指向的函数
+	__asm {
+		mov eax, pFunc
+		jmp eax
+	}
+
+	return 0;
+}
+这里使用了绝对跳转指令 jmp eax，将 eax 寄存器中的地址作为跳转目标。由于 pFunc 指向
+的是 printMessage 函数，因此 eax 中存储的就是 printMessage 函数的地址。执行 jmp eax 指令
+后，处理器会跳转到 printMessage 函数，并在控制台中输出一条消息。
+
+在实际开发中，绝对跳转指令通常用于实现一些低级别的功能，例如在Hooking中修改函数入口地址，
+或者在反汇编中跳转到指定的地址等。
+
+*/
 
 //=========================================================================
 // Internal function:
@@ -648,6 +731,32 @@ static void FixupIPRelativeAddressing(PBYTE pbNew, PBYTE pbOriginal, MHOOKS_PATC
 	}
 #endif
 }
+/*
+author: rubickzhang
+description:
+在 Mhook 中，DisassembleAndSkip 函数会分析目标函数的指令序列，并且根据指令序列的内容计算出每个
+指令的长度。这个函数的主要作用是为了在 Hook 代码中找到目标函数的指令序列，并且计算出 Hook 代码
+需要跳转的位置。
+
+具体而言，DisassembleAndSkip 函数会使用 GetInstruction 函数来分析目标函数的指令序列。它会从目标
+函数的地址开始，一次读取每个指令，并通过调用 GetInstruction 函数来确定每个指令的长度。然后，
+DisassembleAndSkip 函数会将所有指令的长度加起来，从而得到目标函数的总长度。最后，DisassembleAndSkip 
+函数会返回一个指向目标函数结束位置的指针，以便 Hook 代码知道应该从哪里开始执行。
+
+在 DisassembleAndSkip 函数计算出目标函数的长度之后，Hook 代码就可以通过调用 Mhook_SetHook 函数来进行
+Hook 操作。Mhook_SetHook 函数会使用目标函数的地址以及 Hook 函数的地址来构造一个绝对跳转指令，并且将这
+个指令插入到目标函数的开头。由于这个绝对跳转指令会将程序控制权传递给 Hook 函数，所以 Hook 函数就能够在
+目标函数执行之前或之后进行一些额外的操作。
+
+总的来说，Mhook 通过分析目标函数的指令序列，然后在目标函数的开头插入一个绝对跳转指令来实现 Hook 的操作。
+DisassembleAndSkip 函数和 Mhook_SetHook 函数是实现这个过程中的关键部分。
+
+GetInstruction 函数主要用于在解析指令序列时，获取每个指令的长度，以便于跳过已经 hook 的代码，以及确定目
+标函数的跳转点等信息，具体分析如下：（待定。。。。）
+
+
+*/
+
 
 //=========================================================================
 // Examine the machine code at the target function's entry point, and
