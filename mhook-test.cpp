@@ -116,12 +116,22 @@ ULONG WINAPI HookNtClose(HANDLE hHandle) {
 	return TrueNtClose(hHandle);
 }
 
+//void printMessage() {
+//	printf("hello world \n");
+//}
+//
+//typedef void (*PrintMessageFunc)();
 //=========================================================================
 // This is where the work gets done.
 //
 int wmain(int argc, WCHAR* argv[])
 {
 	HANDLE hProc = NULL;
+	//PrintMessageFunc pFunc = printMessage;
+	//__asm {
+	//	mov eax,pFunc
+	//	jmp eax
+	//}
 
 	// Set the hook
 	if (Mhook_SetHook((PVOID*)&TrueNtOpenProcess, HookNtOpenProcess)) {

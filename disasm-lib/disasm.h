@@ -495,6 +495,42 @@ typedef struct _INSTRUCTION_OPERAND
 	};
 } INSTRUCTION_OPERAND;
 
+/*
+[`INSTRUCTION`](command:_github.copilot.openSymbolFromReferences?%5B%22%22%2C%5B%7B%22uri%22%3A%7B%22scheme%22%3A%22file%22%2C%22authority%22%3A%22%22%2C%22path%22%3A%22%2Fdisasm-lib%2Fdisasm.h%22%2C%22query%22%3A%22%22%2C%22fragment%22%3A%22%22%7D%2C%22pos%22%3A%7B%22line%22%3A498%2C%22character%22%7D%7D%5D%2C%22%22%5D "Go to definition") 结构体的各个字段用于存储反汇编过程中解析出的指令信息。以下是各个字段的意义：
+
+- `U32 Initialized`: 指示该结构体是否已初始化。
+- [`struct _DISASSEMBLER *Disassembler`](command:_github.copilot.openSymbolFromReferences?%5B%22%22%2C%5B%7B%22uri%22%3A%7B%22scheme%22%3A%22file%22%2C%22authority%22%3A%22%22%2C%22path%22%3A%22%2Fe%3A%2Fgithub%2Fmhook%2Fdisasm-lib%2Fdisasm.h%22%2C%22query%22%3A%22%22%2C%22fragment%22%3A%22%22%7D%2C%22pos%22%3A%7B%22line%22%3A500%2C%22character%22%3A8%7D%7D%5D%2C%22dae7a871-4b97-40b9-a258-0741a978a0f1%22%5D "Go to definition"): 指向反汇编器实例的指针。
+- `char String[MAX_OPCODE_DESCRIPTION]`: 存储指令的字符串描述。
+- `U8 StringIndex`: 字符串描述的索引。
+- `U64 VirtualAddressDelta`: 虚拟地址增量。
+- `U32 Groups`: 指令组（如 ITYPE_EXEC, ITYPE_ARITH 等），可以是多个组的组合。
+- `INSTRUCTION_TYPE Type`: 指令类型（如 ITYPE_ADD, ITYPE_RET 等），每条指令只有一个类型。
+- [`U8 *Address`](command:_github.copilot.openSymbolFromReferences?%5B%22%22%2C%5B%7B%22uri%22%3A%7B%22scheme%22%3A%22file%22%2C%22authority%22%3A%22%22%2C%22path%22%3A%22%2Fe%3A%2Fgithub%2Fmhook%2Fdisasm-lib%2Fdisasm.h%22%2C%22query%22%3A%22%22%2C%22fragment%22%3A%22%22%7D%2C%22pos%22%3A%7B%22line%22%3A19%2C%22character%22%3A22%7D%7D%5D%2C%22dae7a871-4b97-40b9-a258-0741a978a0f1%22%5D "Go to definition"): 指令在内存中的地址。
+- [`U8 *OpcodeAddress`](command:_github.copilot.openSymbolFromReferences?%5B%22%22%2C%5B%7B%22uri%22%3A%7B%22scheme%22%3A%22file%22%2C%22authority%22%3A%22%22%2C%22path%22%3A%22%2Fe%3A%2Fgithub%2Fmhook%2Fdisasm-lib%2Fdisasm.h%22%2C%22query%22%3A%22%22%2C%22fragment%22%3A%22%22%7D%2C%22pos%22%3A%7B%22line%22%3A19%2C%22character%22%3A22%7D%7D%5D%2C%22dae7a871-4b97-40b9-a258-0741a978a0f1%22%5D "Go to definition"): 操作码的地址。
+- `U32 Length`: 指令的长度。
+- `U8 Prefixes[MAX_PREFIX_LENGTH]`: 存储指令前缀。
+- `U32 PrefixCount`: 前缀的数量。
+- `U8 LastOpcode`: 操作码的最后一个字节。
+- `U8 OpcodeBytes[MAX_OPCODE_LENGTH]`: 存储操作码字节。
+- `U32 OpcodeLength`: 操作码的长度，不包括操作数和前缀。
+- `INSTRUCTION_OPERAND Operands[MAX_OPERAND_COUNT]`: 存储指令的操作数。
+- `U32 OperandCount`: 操作数的数量。
+- `X86_INSTRUCTION X86`: 存储x86指令的特定信息。
+- `DATA_REFERENCE DataSrc`: 数据源引用。
+- `DATA_REFERENCE DataDst`: 数据目标引用。
+- `CODE_BRANCH CodeBranch`: 代码分支信息。
+- `LONG StackChange`: 堆栈变化量，指示指令对堆栈的影响。
+- `U8 StringAligned : 1`: 内部使用，指示字符串是否对齐。
+- `U8 NeedsEmulation : 1`: 指示指令是否需要仿真。
+- `U8 Repeat : 1`: 指示指令是否重复执行（如 REP 前缀）。
+- `U8 ErrorOccurred : 1`: 指示指令是否无效。
+- `U8 AnomalyOccurred : 1`: 指示指令是否异常。
+- `U8 LastInstruction : 1`: 指示这是最后一条指令。
+- `U8 CodeBlockFirst: 1`: 指示这是代码块的第一条指令。
+- `U8 CodeBlockLast : 1`: 指示这是代码块的最后一条指令。
+
+这些字段共同作用，帮助反汇编器解析和存储指令的详细信息。
+*/
 typedef struct _INSTRUCTION
 {
 	U32 Initialized;

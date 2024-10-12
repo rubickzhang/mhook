@@ -285,9 +285,11 @@ int main() {
 	PrintMessageFunc pFunc = printMessage;
 
 	// 使用绝对跳转指令，跳转到 pFunc 指向的函数
+	// 使用 call eax 而不是 jmp eax，因为 call 指令会保存返回地址，
+	// 从而允许函数正常返回到 main 函数。
 	__asm {
 		mov eax, pFunc
-		jmp eax
+		call eax
 	}
 
 	return 0;
@@ -299,7 +301,83 @@ int main() {
 在实际开发中，绝对跳转指令通常用于实现一些低级别的功能，例如在Hooking中修改函数入口地址，
 或者在反汇编中跳转到指定的地址等。
 
+该函数的主要步骤如下：
+
+保存原始代码地址：保存传入的代码地址 pbOrgCode。
+处理特定平台的指令：
+x86 平台：
+跳过 mov edi, edi 指令（热补丁点）。
+跳过 push ebp; mov ebp, esp; pop ebp 指令（MSVC 生成的“折叠”栈帧）。
+x86 和 x64 平台：
+如果指令是 jmp [address]（绝对跳转），则递归调用 SkipJumps 跳转到目标地址。
+如果指令是 jmp offset（相对跳转），则递归调用 SkipJumps 跳转到目标地址。
+如果指令是 jmp short offset（短跳转），则递归调用 SkipJumps 跳转到目标地址。
+返回实际的函数入口地址：如果没有跳转指令，则返回原始代码地址 pbOrgCode。
+这个函数在 Hook 函数中非常有用，因为它可以跳过目标函数前面的跳转指令，找到实际
+的函数入口地址，从而确保 Hook 操作的准确性。
+
+机器码解释：
+0x8b:
+
+mov 指令：用于将数据从一个位置移动到另一个位置。
+0x8b 是 mov 指令的操作码，具体的操作取决于后续的字节。例如，0x8b 0xff 表示 mov edi, edi，这是一个常见的热补丁点（hot patch point）。
+0xff:
+
+jmp 或 call 指令：用于跳转或调用函数。
+0xff 是多功能操作码，具体的操作取决于后续的字节。例如，0xff 0x25 表示 jmp [address]，这是一个绝对间接跳转。
+0x55:
+
+push 指令：用于将数据压入堆栈。
+0x55 表示 push ebp，将基址指针寄存器 ebp 的值压入堆栈。这通常用于函数的栈帧设置。
+0xec:
+in 指令：用于从 I/O 端口读取数据。
+0xec 表示 in al, dx，从端口 dx 读取一个字节到累加器 al 中。
+
+0x5d：   pop ebp 指令的操作码。
+
+0xe9 是 jmp 指令的操作码，表示一个相对跳转（relative jump）。具体来说，0xe9 后面跟随一个 32 位的偏移量，用于指定跳转目标地址。
+
+以下是 0xe9 指令的详细解释：
+
+jmp 指令：用于无条件跳转到指定的目标地址。
+相对跳转：跳转目标地址是相对于当前指令的地址加上偏移量计算得出的。
+
+
+0x8b 0xff       ; mov edi, edi
+                ; 这是一个热补丁点，通常用于在运行时替换函数代码。
+
+0xff 0x25       ; jmp [address]
+                ; 这是一个绝对间接跳转，跳转到存储在指定地址的目标地址。
+
+0x55            ; push ebp
+                ; 将基址指针寄存器 `ebp` 的值压入堆栈，通常用于函数的栈帧设置。
+
+0xec            ; in al, dx
+                ; 从端口 `dx` 读取一个字节到累加器 `al` 中。
+pop ebp:
+pop 指令：用于从堆栈中弹出数据。
+ebp：基址指针寄存器。
+
+e9 xx xx xx xx
+e9：jmp 指令的操作码。
+xx xx xx xx：32 位的偏移量（以小端序存储），表示从当前指令的下一条指令开始的偏移量。
+0xe9 0x05 0x00 0x00 0x00  ; jmp 0x00000005
+这条指令表示从当前指令的下一条指令开始跳转 5 个字节。
+
+
+
+以下是一个典型的函数栈帧设置和清理的汇编代码示例：
+push ebp        ; 保存调用者的栈帧指针
+mov ebp, esp    ; 设置当前栈帧指针
+; 函数体
+pop ebp         ; 恢复调用者的栈帧指针
+ret             ; 返回调用者
+在这个示例中，push ebp 和 mov ebp, esp 用于设置新的栈帧，而 pop ebp 和 ret
+ 用于清理栈帧并返回调用者。0x5d 操作码对应的 pop ebp 指令在函数结束时恢复调用者的栈帧指针。
+
+
 */
+
 
 //=========================================================================
 // Internal function:
@@ -339,6 +417,11 @@ static PBYTE SkipJumps(PBYTE pbCode) {
 	} else if (pbCode[0] == 0xe9) {
 		// here the behavior is identical, we have...
 		// ...a 32-bit offset to the destination.
+		/*
+		检查当前指令是否是 jmp 指令（操作码为 0xe9）。
+        如果是，则读取 32 位的偏移量，并计算跳转目标地址。
+        递归调用 SkipJumps 函数，跳转到目标地址，继续解析。
+		*/
 		return SkipJumps(pbCode + 5 + *(INT32 *)&pbCode[1]);
 	} else if (pbCode[0] == 0xeb) {
 		// and finally an 8-bit offset to the destination
@@ -477,6 +560,25 @@ static MHOOKS_TRAMPOLINE* FindTrampolineInRange(PBYTE pLower, PBYTE pUpper) {
 	return NULL;
 }
 
+/*
+在确定分配位置的上下界时，加上偏移 0x7ff80000 是为了确保分配的内存
+块在目标函数附近的合理范围内。这个偏移量的选择是为了在目标函数的上
+下 2GB 范围内找到一个合适的内存块，以便跳板（trampoline）能够正常工作。
+
+具体来说，x86 和 x64 架构中的相对跳转指令（如 jmp 和 call）有一个范围
+限制，通常是 ±2GB。为了确保跳板能够在这个范围内进行跳转，需要在目标
+函数的上下 2GB 范围内分配内存。
+
+pLower 和 pUpper 分别表示分配位置的下界和上界。
+pLower 的计算：如果 pSystemFunction + nLimitUp 小于 0x0000000080000000，
+则将 pLower 设置为 0x1，否则减去 0x7fff0000。
+pUpper 的计算：如果 pSystemFunction + nLimitDown 小于 0xffffffff80000000，
+则将 pUpper 加上 0x7ff80000，否则设置为 0xfffffffffff80000。
+这些计算确保了分配位置在目标函数的上下 2GB 范围内，从而使跳板能够正常工作。
+具体来说，0x7ff80000 是一个接近 2GB 的值，用于调整分配位置的范围，以确保跳
+板能够在目标函数附近找到合适的内存块。
+0x7ff80000 = 1024 * 1024 * 2047  -> 2G
+*/
 //=========================================================================
 // Internal function:
 //
@@ -734,25 +836,19 @@ static void FixupIPRelativeAddressing(PBYTE pbNew, PBYTE pbOriginal, MHOOKS_PATC
 /*
 author: rubickzhang
 description:
-在 Mhook 中，DisassembleAndSkip 函数会分析目标函数的指令序列，并且根据指令序列的内容计算出每个
-指令的长度。这个函数的主要作用是为了在 Hook 代码中找到目标函数的指令序列，并且计算出 Hook 代码
-需要跳转的位置。
+DisassembleAndSkip函数的主要功能是对目标函数的机器码进行反汇编，并跳过一定长度的指令，
+以确保始终在指令边界上结束。它还会检测分支和子程序调用（以及返回），
+在这些点上停止反汇编。最后，它会检测并收集可以修补的IP相对指令的信息。
 
-具体而言，DisassembleAndSkip 函数会使用 GetInstruction 函数来分析目标函数的指令序列。它会从目标
-函数的地址开始，一次读取每个指令，并通过调用 GetInstruction 函数来确定每个指令的长度。然后，
-DisassembleAndSkip 函数会将所有指令的长度加起来，从而得到目标函数的总长度。最后，DisassembleAndSkip 
-函数会返回一个指向目标函数结束位置的指针，以便 Hook 代码知道应该从哪里开始执行。
+以下是DisassembleAndSkip函数的具体逻辑：
 
-在 DisassembleAndSkip 函数计算出目标函数的长度之后，Hook 代码就可以通过调用 Mhook_SetHook 函数来进行
-Hook 操作。Mhook_SetHook 函数会使用目标函数的地址以及 Hook 函数的地址来构造一个绝对跳转指令，并且将这
-个指令插入到目标函数的开头。由于这个绝对跳转指令会将程序控制权传递给 Hook 函数，所以 Hook 函数就能够在
-目标函数执行之前或之后进行一些额外的操作。
-
-总的来说，Mhook 通过分析目标函数的指令序列，然后在目标函数的开头插入一个绝对跳转指令来实现 Hook 的操作。
-DisassembleAndSkip 函数和 Mhook_SetHook 函数是实现这个过程中的关键部分。
-
-GetInstruction 函数主要用于在解析指令序列时，获取每个指令的长度，以便于跳过已经 hook 的代码，以及确定目
-标函数的跳转点等信息，具体分析如下：（待定。。。。）
+初始化反汇编器并设置架构类型（x86或x64）。
+使用GetInstruction函数逐条获取目标函数的指令。
+对每条指令进行处理：
+如果指令类型是返回、分支或调用，则停止反汇编。
+对于x64架构，处理RIP相对寻址的指令，计算相对位移并存储相关信息。
+累加指令长度，直到达到指定的最小长度dwMinLen。
+关闭反汇编器并返回累加的指令长度。
 
 
 */

@@ -1,4 +1,4 @@
-// Copyright (C) 2004, Matt Conover (mconover@gmail.com)
+﻿// Copyright (C) 2004, Matt Conover (mconover@gmail.com)
 #undef NDEBUG
 #include <assert.h>
 #include <windows.h>
@@ -106,6 +106,7 @@ INSTRUCTION *GetInstruction(DISASSEMBLER *Disassembler, U64 VirtualAddress, U8 *
 
 ///////////////////////////////////////////////////////////////////////////
 // Miscellaneous
+// 获取支持的架构
 ///////////////////////////////////////////////////////////////////////////
 
 static ARCHITECTURE_FORMAT *GetArchitectureFormat(ARCHITECTURE_TYPE Type)
