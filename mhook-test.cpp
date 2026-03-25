@@ -17,16 +17,27 @@
 //LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING 
 //FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS 
 //IN THE SOFTWARE.
+//
+// mhook-test.cpp - mhook 库功能测试程序
+//
+// 演示如何使用 Mhook_SetHook / Mhook_Unhook 对多个 Windows API 进行拦截：
+//   - NtOpenProcess  (ntdll.dll)
+//   - SelectObject   (gdi32.dll)
+//   - getaddrinfo    (ws2_32.dll)
+//   - HeapAlloc      (kernel32.dll)
+//   - NtClose        (ntdll.dll)
+//
+// 每个 Hook 函数在调用原始函数前打印一条调试信息，展示拦截效果。
 
 #include "stdafx.h"
 #include "mhook-lib/mhook.h"
 
 //=========================================================================
-// Define _NtOpenProcess so we can dynamically bind to the function
+// NtOpenProcess 的类型定义（动态绑定，避免直接链接 ntdll 导入库）
 //
 typedef struct _CLIENT_ID {
-	DWORD_PTR UniqueProcess;
-	DWORD_PTR UniqueThread;
+	DWORD_PTR UniqueProcess;  // 进程 ID
+	DWORD_PTR UniqueThread;   // 线程 ID
 } CLIENT_ID, *PCLIENT_ID;
 
 typedef ULONG (WINAPI* _NtOpenProcess)(OUT PHANDLE ProcessHandle, 
@@ -34,23 +45,23 @@ typedef ULONG (WINAPI* _NtOpenProcess)(OUT PHANDLE ProcessHandle,
 		 IN PCLIENT_ID ClientId ); 
 
 //=========================================================================
-// Define _SelectObject so we can dynamically bind to the function
+// SelectObject 的函数指针类型定义（动态绑定）
 typedef HGDIOBJ (WINAPI* _SelectObject)(HDC hdc, HGDIOBJ hgdiobj); 
 
 //=========================================================================
-// Define _getaddrinfo so we can dynamically bind to the function
+// getaddrinfo 的函数指针类型定义（动态绑定）
 typedef int (WSAAPI* _getaddrinfo)(const char* nodename, const char* servname, const struct addrinfo* hints, struct addrinfo** res);
 
 //=========================================================================
-// Define _HeapAlloc so we can dynamically bind to the function
+// HeapAlloc 的函数指针类型定义（动态绑定）
 typedef LPVOID (WINAPI *_HeapAlloc)(HANDLE, DWORD, SIZE_T);
 
 //=========================================================================
-// Define _NtClose so we can dynamically bind to the function
+// NtClose 的函数指针类型定义（动态绑定）
 typedef ULONG (WINAPI* _NtClose)(IN HANDLE Handle);
 
 //=========================================================================
-// Get the current (original) address to the functions to be hooked
+// 保存各函数的原始地址（Hook 安装后这些指针指向跳板，可间接调用原始逻辑）
 //
 _NtOpenProcess TrueNtOpenProcess = (_NtOpenProcess)
 	GetProcAddress(GetModuleHandle(L"ntdll"), "NtOpenProcess");
@@ -65,8 +76,8 @@ _HeapAlloc TrueHeapAlloc = (_HeapAlloc)GetProcAddress(GetModuleHandle(L"kernel32
 _NtClose TrueNtClose = (_NtClose)GetProcAddress(GetModuleHandle(L"ntdll"), "NtClose");
 
 //=========================================================================
-// This is the function that will replace NtOpenProcess once the hook 
-// is in place
+// NtOpenProcess 的 Hook 函数：
+// 打印进程 ID 后透传给原始函数，不影响正常行为。
 //
 ULONG WINAPI HookNtOpenProcess(OUT PHANDLE ProcessHandle, 
 							   IN ACCESS_MASK AccessMask, 
@@ -79,8 +90,9 @@ ULONG WINAPI HookNtOpenProcess(OUT PHANDLE ProcessHandle,
 }
 
 //=========================================================================
-// This is the function that will replace SelectObject once the hook 
-// is in place
+// SelectObject 的 Hook 函数：
+// 打印 HDC 和 HGDIOBJ 后透传给原始函数。
+// （SelectObject 在 XP x64 的跳板中使用了 RIP 相对寻址，是 mhook 特殊处理的测试用例。）
 //
 HGDIOBJ WINAPI HookSelectobject(HDC hdc, HGDIOBJ hgdiobj)
 {
@@ -89,8 +101,8 @@ HGDIOBJ WINAPI HookSelectobject(HDC hdc, HGDIOBJ hgdiobj)
 }
 
 //=========================================================================
-// This is the function that will replace SelectObject once the hook 
-// is in place
+// getaddrinfo 的 Hook 函数：
+// 打印所有参数后透传给原始函数。
 //
 int WSAAPI Hookgetaddrinfo(const char* nodename, const char* servname, const struct addrinfo* hints, struct addrinfo** res)
 {
@@ -99,8 +111,8 @@ int WSAAPI Hookgetaddrinfo(const char* nodename, const char* servname, const str
 }
 
 //=========================================================================
-// This is the function that will replace HeapAlloc once the hook 
-// is in place
+// HeapAlloc 的 Hook 函数：
+// 打印堆句柄和分配大小后透传给原始函数。
 //
 LPVOID WINAPI HookHeapAlloc(HANDLE a_Handle, DWORD a_Bla, SIZE_T a_Bla2) {
 	printf("***** Call to HeapAlloc(0x%p, %u, 0x%p)\n", a_Handle, a_Bla, a_Bla2);
@@ -108,35 +120,25 @@ LPVOID WINAPI HookHeapAlloc(HANDLE a_Handle, DWORD a_Bla, SIZE_T a_Bla2) {
 }
 
 //=========================================================================
-// This is the function that will replace NtClose once the hook 
-// is in place
+// NtClose 的 Hook 函数：
+// 打印句柄值后透传给原始函数。
 //
 ULONG WINAPI HookNtClose(HANDLE hHandle) {
 	printf("***** Call to NtClose(0x%p)\n", hHandle);
 	return TrueNtClose(hHandle);
 }
 
-//void printMessage() {
-//	printf("hello world \n");
-//}
-//
-//typedef void (*PrintMessageFunc)();
 //=========================================================================
-// This is where the work gets done.
+// wmain - 测试程序入口
+// 依次测试每个 API 的 Hook 安装与卸载，并观察输出验证拦截效果。
 //
 int wmain(int argc, WCHAR* argv[])
 {
 	HANDLE hProc = NULL;
-	//PrintMessageFunc pFunc = printMessage;
-	//__asm {
-	//	mov eax,pFunc
-	//	jmp eax
-	//}
 
-	// Set the hook
+	// ---- 测试 NtOpenProcess Hook ----
 	if (Mhook_SetHook((PVOID*)&TrueNtOpenProcess, HookNtOpenProcess)) {
-		// Now call OpenProcess and observe NtOpenProcess being redirected
-		// under the hood.
+		// OpenProcess 内部会调用 NtOpenProcess，此时应触发 Hook 输出
 		hProc = OpenProcess(PROCESS_ALL_ACCESS, 
 			FALSE, GetCurrentProcessId());
 		if (hProc) {
@@ -145,12 +147,11 @@ int wmain(int argc, WCHAR* argv[])
 		} else {
 			printf("Could not open self: %d\n", GetLastError());
 		}
-		// Remove the hook
+		// 卸载 Hook，恢复原始 NtOpenProcess
 		Mhook_Unhook((PVOID*)&TrueNtOpenProcess);
 	}
 
-	// Call OpenProces again - this time there won't be a redirection as
-	// the hook has bee removed.
+	// 验证卸载后不再触发 Hook 输出
 	hProc = OpenProcess(PROCESS_ALL_ACCESS, FALSE, GetCurrentProcessId());
 	if (hProc) {
 		printf("Successfully opened self: %p\n", hProc);
@@ -159,15 +160,11 @@ int wmain(int argc, WCHAR* argv[])
 		printf("Could not open self: %d\n", GetLastError());
 	}
 
-	// Test another hook, this time in SelectObject
-	// (SelectObject is interesting in that on XP x64, the second instruction
-	// in the trampoline uses IP-relative addressing and we need to do some
-	// extra work under the hood to make things work properly. This really
-	// is more of a test case rather than a demo.)
+	// ---- 测试 SelectObject Hook ----
+	// 具体意义：在 Windows XP x64 上，SelectObject 的第二条指令使用 RIP 相对寻址，
+	// 这是测试 mhook 是否能正确修复跳板中 RIP 相对指令的关键用例。
 	printf("Testing SelectObject.\n");
 	if (Mhook_SetHook((PVOID*)&TrueSelectObject, HookSelectobject)) {
-		// error checking omitted for brevity. doesn't matter much 
-		// in this context anyway.
 		HDC hdc = GetDC(NULL);
 		HDC hdcMem = CreateCompatibleDC(hdc);
 		HBITMAP hbm = CreateCompatibleBitmap(hdc, 32, 32);
@@ -176,14 +173,13 @@ int wmain(int argc, WCHAR* argv[])
 		DeleteObject(hbm);
 		DeleteDC(hdcMem);
 		ReleaseDC(NULL, hdc);
-		// Remove the hook
+		// 卸载 Hook
 		Mhook_Unhook((PVOID*)&TrueSelectObject);
 	}
 
 	printf("Testing getaddrinfo.\n");
+	// ---- 测试 getaddrinfo Hook ----
 	if (Mhook_SetHook((PVOID*)&Truegetaddrinfo, Hookgetaddrinfo)) {
-		// error checking omitted for brevity. doesn't matter much 
-		// in this context anyway.
 		WSADATA wd = {0};
 		WSAStartup(MAKEWORD(2, 2), &wd);
 		char* ip = "localhost";
@@ -203,23 +199,27 @@ int wmain(int argc, WCHAR* argv[])
 			printf("got %d addresses\n", n);
 		}
 		WSACleanup();
-		// Remove the hook
+		// 卸载 getaddrinfo Hook
 		Mhook_Unhook((PVOID*)&Truegetaddrinfo);
 	}
 
+	// ---- 测试 HeapAlloc Hook ----
 	printf("Testing HeapAlloc.\n");
 	if (Mhook_SetHook((PVOID*)&TrueHeapAlloc, HookHeapAlloc))
 	{
+		// malloc 内部会调用 HeapAlloc，应触发 Hook 输出
 		free(malloc(10));
-		// Remove the hook
+		// 卸载 HeapAlloc Hook
 		Mhook_Unhook((PVOID*)&TrueHeapAlloc);
 	}
 
+	// ---- 测试 NtClose Hook ----
 	printf("Testing NtClose.\n");
 	if (Mhook_SetHook((PVOID*)&TrueNtClose, HookNtClose))
 	{
+		// CloseHandle(NULL) 内部会调用 NtClose，应触发 Hook 输出
 		CloseHandle(NULL);
-		// Remove the hook
+		// 卸载 NtClose Hook
 		Mhook_Unhook((PVOID*)&TrueNtClose);
 	}
 

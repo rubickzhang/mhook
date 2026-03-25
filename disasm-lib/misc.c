@@ -1,6 +1,10 @@
 // Copyright (C) 2002, Matt Conover (mconover@gmail.com)
+//
+// misc.c - 通用工具函数实现
+// 包含十六进制字符判断和字符串转换功能。
 #include "misc.h"
 
+// 判断字符是否为合法的十六进制字符（0-9、A-F、a-f）
 BOOL IsHexChar(BYTE ch)
 {
 	switch (ch)
@@ -17,7 +21,12 @@ BOOL IsHexChar(BYTE ch)
 	}
 }
 
-// NOTE: caller must free the buffer returned
+// 将十六进制字符串转换为二进制字节数组。
+// 支持以下三种输入格式：
+//   (1) 以空格分隔的十六进制对，例如 "41 42 43"
+//   (2) "\x" 或 "\0" 开头的转义格式，例如 "\x41\x42\x43"
+//   (3) 无分隔符的连续十六进制字符串，例如 "414243"
+// 注意：调用方负责释放返回的缓冲区（使用 free）
 BYTE *HexToBinary(char *Input, DWORD InputLength, DWORD *OutputLength)
 {
 	DWORD i, j, ByteCount = 0;

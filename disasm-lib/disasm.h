@@ -1,11 +1,12 @@
 // Copyright (C) 2004, Matt Conover (mconover@gmail.com)
 //
-// WARNING:
-// I wouldn't recommend changing any flags like OP_*, ITYPE_*, or *_MASK
-// aside from those marked as UNUSED. This is because the flags parts of
-// the flags are architecture independent and other are left to specific
-// architectures to define, so unless you understand the relationships
-// between them, I would leave them as is.
+// disasm.h - 通用反汇编器接口头文件
+// 定义了反汇编指令、操作数、指令类型、体系结构等核心数据结构。
+//
+// 警告：
+// 不建议修改任何 OP_*、ITYPE_*、*_MASK 等标志（标注为 UNUSED 的除外）。
+// 这些标志有一部分是体系无关的，另一部分由具体体系定义，
+// 在没有充分了解其相互关系之前请勿擅自修改。
 
 #ifndef DISASM_H
 #define DISASM_H
@@ -16,6 +17,7 @@ extern "C" {
 #include <stdio.h>
 #include "misc.h"
 
+// 基本整数类型的类型别名
 typedef signed char S8;
 typedef unsigned char U8;
 typedef signed short S16;
@@ -26,7 +28,7 @@ typedef LONG64 S64;
 typedef ULONG64 U64;
 
 #ifdef SPEEDY
-// On Visual Studio 6, making the internal functions inline makes compiling take forever
+// 在 Visual Studio 6 下将内部函数设为 inline 会导致编译极慢，此处封装相关宏
 #define INTERNAL static _inline 
 #define INLINE _inline
 #else
@@ -34,71 +36,78 @@ typedef ULONG64 U64;
 #define INLINE
 #endif
 
+// 判断一条指令是否有效（非 NULL 且未发生错误）
 #define VALID_INSTRUCTION(i) ((i) && !((i)->ErrorOccurred))
+// 获取下一条指令的地址（当前地址 + 当前指令长度）
 #define NEXT_INSTRUCTION(i) ((i)->Address + (i)->Length)
+// 获取反汇编器的体系类型
 #define DISASM_ARCH_TYPE(dis) ((dis)->ArchType)
+// 获取指令所属反汇编器的体系类型
 #define INS_ARCH_TYPE(ins) DISASM_ARCH_TYPE((ins)->Disassembler)
 
-// NOTE: these should be as big set to the maximum of the supported architectures
-#define MAX_PREFIX_LENGTH 15
-#define MAX_OPERAND_COUNT 3
-#define MAX_INSTRUCTION_LENGTH 25
-#define MAX_OPCODE_LENGTH 3
-#define MAX_OPCODE_DESCRIPTION 256
+// 各项最大长度常量（应设为所支持体系的最大値）
+#define MAX_PREFIX_LENGTH 15          // 指令前缀最大数量
+#define MAX_OPERAND_COUNT 3           // 操作数最多个数
+#define MAX_INSTRUCTION_LENGTH 25     // 指令最大字节数
+#define MAX_OPCODE_LENGTH 3           // 操作码最大字节数
+#define MAX_OPCODE_DESCRIPTION 256    // 指令文字描述的最大长度
 
 /////////////////////////////////////////////////////////////////////
-// Code branch
+// 代码分支信息结构体
 /////////////////////////////////////////////////////////////////////
 
+// 代码分支目标地址的最大数量
 #define MAX_CODE_REFERENCE_COUNT 3
 
+// 代码分支信息：存储指令的跳转目标
+// 对于条件跳转 / 调用指令，Addresses 包含可能的目标地址
 typedef struct _CODE_BRANCH
 {
-	U64 Addresses[MAX_CODE_REFERENCE_COUNT]; // NULL if multiple to addresses
-	U32 Count;
-	U8 IsLoop : 1;
-	U8 IsCall : 1; // branch if false
-	U8 IsIndirect : 1; // call/jmp [Address]
-	U8 AddressOffset: 5;
-	struct _INSTRUCTION_OPERAND *Operand; // the operand containg the address
+	U64 Addresses[MAX_CODE_REFERENCE_COUNT]; // 跳转目标地址列表（多目标时为 NULL）
+	U32 Count;                               // 目标地址的数量
+	U8 IsLoop : 1;                           // 是否是循环指令（LOOP/LOOPE/LOOPNE）
+	U8 IsCall : 1;                           // 为 1 表示调用指令，为 0 表示跳转指令
+	U8 IsIndirect : 1;                       // 是否是间接调用/跳转（call/jmp [Address] 形式）
+	U8 AddressOffset: 5;                     // 地址在指令中的偏移量
+	struct _INSTRUCTION_OPERAND *Operand;    // 包含目标地址的操作数
 } CODE_BRANCH;
 
 /////////////////////////////////////////////////////////////////////
-// Data references
+// 数据引用信息结构体
 /////////////////////////////////////////////////////////////////////
 
+// 数据引用目标地址的最大数量
 #define MAX_DATA_REFERENCE_COUNT 3
 
+// 数据引用信息：存储指令访问的数据地址
 typedef struct _DATA_REFERENCE
 {
-	U64 Addresses[MAX_DATA_REFERENCE_COUNT]; // NULL if multiple to addresses
-	U32 Count;
-	ULONG_PTR DataSize;
-	struct _INSTRUCTION_OPERAND *Operand; // the operand containg the address
+	U64 Addresses[MAX_DATA_REFERENCE_COUNT]; // 引用的数据地址列表（多地址时为 NULL）
+	U32 Count;                               // 引用地址数量
+	ULONG_PTR DataSize;                      // 被引用数据的大小（字节数）
+	struct _INSTRUCTION_OPERAND *Operand;    // 包含引用地址的操作数
 } DATA_REFERENCE;
 
 ////////////////////////////////////////////////////////////////////
-// Instruction
+// 指令分类定义
 /////////////////////////////////////////////////////////////////////
 
-//
-// Instruction types (bits 0-7)
-// Instruction groups (bits 8-26)
-//
-#define ITYPE_EXEC_OFFSET     (1<<8)
-#define ITYPE_ARITH_OFFSET    (1<<9)
-#define ITYPE_LOGIC_OFFSET    (1<<10)
-#define ITYPE_STACK_OFFSET    (1<<11)
-#define ITYPE_TESTCOND_OFFSET (1<<12)
-#define ITYPE_LOAD_OFFSET     (1<<13)
-#define ITYPE_ARRAY_OFFSET    (1<<14)
-#define ITYPE_BIT_OFFSET      (1<<15)
-#define ITYPE_FLAG_OFFSET     (1<<16)
-#define ITYPE_FPU_OFFSET      (1<<17)
-#define ITYPE_TRAPS_OFFSET    (1<<18)
-#define ITYPE_SYSTEM_OFFSET   (1<<19)
-#define ITYPE_OTHER_OFFSET    (1<<20)
-#define ITYPE_UNUSED1_OFFSET  (1<<21)
+// 指令组偏移量（bits 8-26）：每个组占一个 bit 位，可组合使用
+// 指令类型（bits 0-7）：标识指令在组内的具体类型，互斥
+#define ITYPE_EXEC_OFFSET     (1<<8)   // 执行控制类（分支、调用、返回）
+#define ITYPE_ARITH_OFFSET    (1<<9)   // 算术运算类
+#define ITYPE_LOGIC_OFFSET    (1<<10)  // 逻辑运算类
+#define ITYPE_STACK_OFFSET    (1<<11)  // 堆栈操作类
+#define ITYPE_TESTCOND_OFFSET (1<<12)  // 条件测试类
+#define ITYPE_LOAD_OFFSET     (1<<13)  // 数据加载/传送类
+#define ITYPE_ARRAY_OFFSET    (1<<14)  // 字符串/数组操作类
+#define ITYPE_BIT_OFFSET      (1<<15)  // 位操作类
+#define ITYPE_FLAG_OFFSET     (1<<16)  // 标志位操作类
+#define ITYPE_FPU_OFFSET      (1<<17)  // 浮点运算类
+#define ITYPE_TRAPS_OFFSET    (1<<18)  // 陷阱/中断类
+#define ITYPE_SYSTEM_OFFSET   (1<<19)  // 系统指令类
+#define ITYPE_OTHER_OFFSET    (1<<20)  // 其他指令类
+#define ITYPE_UNUSED1_OFFSET  (1<<21)  // 未使用（可由架构自定义）
 #define ITYPE_UNUSED2_OFFSET  (1<<22)
 #define ITYPE_UNUSED3_OFFSET  (1<<23)
 #define ITYPE_UNUSED4_OFFSET  (1<<24)
@@ -110,50 +119,46 @@ typedef struct _DATA_REFERENCE
 #define ITYPE_EXT_UNUSED4     (1<<30)
 #define ITYPE_EXT_UNUSED5     (1<<31)
 
-//
-// X86-specific flags (bits 27-31)
-//
+// x86 指令组扩展标志（bits 27-31）
+#define ITYPE_EXT_64     ITYPE_EXT_UNUSED1 // 64 位模式下使用索引 1，否则用索引 0
+#define ITYPE_EXT_MODRM  ITYPE_EXT_UNUSED2 // ModRM 字节可能延伸操作码
+#define ITYPE_EXT_SUFFIX ITYPE_EXT_UNUSED3 // ModRM/SIB/位移后的字节是第三操作码字节
+#define ITYPE_EXT_PREFIX ITYPE_EXT_UNUSED4 // 该条目是前缀
+#define ITYPE_EXT_FPU    ITYPE_EXT_UNUSED5 // FPU 指令需要特殊处理
 
-#define ITYPE_EXT_64     ITYPE_EXT_UNUSED1 // Use index 1 if in 64-bit mode and 0 otherwise
-#define ITYPE_EXT_MODRM  ITYPE_EXT_UNUSED2 // ModRM byte may extend the opcode
-#define ITYPE_EXT_SUFFIX ITYPE_EXT_UNUSED3 // byte after ModRM/SIB/displacement is the third opcode
-#define ITYPE_EXT_PREFIX ITYPE_EXT_UNUSED4 // prefix
-#define ITYPE_EXT_FPU    ITYPE_EXT_UNUSED5 // FPU instructions require special handling
+// SIMD 指令集组偏移量定义
+#define ITYPE_3DNOW_OFFSET ITYPE_UNUSED1_OFFSET  // AMD 3DNow! 指令
+#define ITYPE_MMX_OFFSET   ITYPE_UNUSED2_OFFSET  // MMX 指令
+#define ITYPE_SSE_OFFSET   ITYPE_UNUSED3_OFFSET  // SSE 指令
+#define ITYPE_SSE2_OFFSET  ITYPE_UNUSED4_OFFSET  // SSE2 指令
+#define ITYPE_SSE3_OFFSET  ITYPE_UNUSED5_OFFSET  // SSE3 指令
 
-#define ITYPE_3DNOW_OFFSET ITYPE_UNUSED1_OFFSET
-#define ITYPE_MMX_OFFSET   ITYPE_UNUSED2_OFFSET
-#define ITYPE_SSE_OFFSET   ITYPE_UNUSED3_OFFSET
-#define ITYPE_SSE2_OFFSET  ITYPE_UNUSED4_OFFSET
-#define ITYPE_SSE3_OFFSET  ITYPE_UNUSED5_OFFSET
+// 指令类型掌码
+#define ITYPE_TYPE_MASK  0x7FFFFFFF  // 提取指令类型字段
+#define ITYPE_GROUP_MASK 0x7FFFFF00  // 提取指令组字段
 
-//
-// Instruction types
-//
-
-#define ITYPE_TYPE_MASK  0x7FFFFFFF
-#define ITYPE_GROUP_MASK 0x7FFFFF00
-
+// 指令类型枚举定义
 typedef enum _INSTRUCTION_TYPE
 {
-	// ITYPE_EXEC group
-	ITYPE_EXEC = ITYPE_EXEC_OFFSET,
-	ITYPE_BRANCH,
-	ITYPE_BRANCHCC, // conditional (not necessarily just flags)
-	ITYPE_CALL,
-	ITYPE_CALLCC, // conditional (not necessarily just flags)
-	ITYPE_RET,
-	ITYPE_LOOPCC,
+	// ITYPE_EXEC 组：执行流程控制
+	ITYPE_EXEC = ITYPE_EXEC_OFFSET,  // 直接跳转/分支
+	ITYPE_BRANCH,                    // 无条件跳转
+	ITYPE_BRANCHCC, // 条件跳转（不仅限于标志位条件）
+	ITYPE_CALL,                      // 调用指令
+	ITYPE_CALLCC, // 条件调用（不仅限于标志位条件）
+	ITYPE_RET,                       // 返回指令
+	ITYPE_LOOPCC,                    // 循环指令（LOOP/LOOPE/LOOPNE）
 
-	// ITYPE_ARITH group
+	// ITYPE_ARITH 组：算术运算
 	ITYPE_ARITH = ITYPE_ARITH_OFFSET,
-	ITYPE_XCHGADD,
+	ITYPE_XCHGADD,  // 交换名并加
 	ITYPE_ADD,
 	ITYPE_SUB,
 	ITYPE_MUL,
 	ITYPE_DIV,
-	ITYPE_INC,
-	ITYPE_DEC,
-	ITYPE_SHL,
+	ITYPE_INC,       // 自增
+	ITYPE_DEC,       // 自减
+	ITYPE_SHL,       // 左移
 	ITYPE_SHR,
 	ITYPE_ROL,
 	ITYPE_ROR,
@@ -339,72 +344,64 @@ typedef enum _INSTRUCTION_TYPE
 		ITYPE_SZCONV   // convert size of operand
 } INSTRUCTION_TYPE;
 
-//
-// Operand flags
-//
+// 操作数标志定义
 
-// Type = bits 0-6 (these are mutually exclusive -- bits 0-6 will always be a power of 2))
-#define OPTYPE_NONE    0x00
-#define OPTYPE_IMM    0x01 // immediate value
-#define OPTYPE_OFFSET 0x02 // relative offset
-#define OPTYPE_FLOAT  0x03 // floating point
-#define OPTYPE_BCD    0x04
-#define OPTYPE_STRING 0x05
-#define OPTYPE_SPECIAL 0x06
-#define OPTYPE_MASK   0x7F
+// 操作数类型（Type = bits 0-6），互斥，始终是 2 的幂
+#define OPTYPE_NONE    0x00  // 无操作数
+#define OPTYPE_IMM    0x01   // 立即数就被编码在指令中
+#define OPTYPE_OFFSET 0x02   // 相对地址偏移量
+#define OPTYPE_FLOAT  0x03   // 浮点小数
+#define OPTYPE_BCD    0x04   // BCD 码
+#define OPTYPE_STRING 0x05   // 字符串操作数
+#define OPTYPE_SPECIAL 0x06  // 特殊操作数
+#define OPTYPE_MASK   0x7F   // 操作数类型掉码
 
-// Flags = bits 7-23 (these can be combinations)
-// These are used in the X86 opcode table
-#define OP_REG      (1<<7) // 0x80
-#define OP_SIGNED   (1<<8)
-#define OP_SYS      (1<<9) // parameter is an index into some system structure
-#define OP_CONDR    (1<<10)
-#define OP_CONDW    (1<<11)
-#define OP_UNUSED   (1<<12)
-#define OP_SRC      (1<<13) // operand is source operand
-#define OP_DST      (1<<14) // operand is destination operand
-#define OP_EXEC     (1<<15) // operand is executed
+// 操作数标志（Flags = bits 7-23），可组合使用，在 x86 操作码表中使用
+#define OP_REG      (1<<7)   // 操作数是寄存器
+#define OP_SIGNED   (1<<8)   // 有符号操作数
+#define OP_SYS      (1<<9)   // 操作数是某系统结构的索引
+#define OP_CONDR    (1<<10)  // 有条件读操作
+#define OP_CONDW    (1<<11)  // 有条件写操作
+#define OP_UNUSED   (1<<12)  // 未使用
+#define OP_SRC      (1<<13)  // 操作数是源操作数
+#define OP_DST      (1<<14)  // 操作数是目标操作数
+#define OP_EXEC     (1<<15)  // 操作数中存的是可执行地址
 
 #define OP_CONDE     OP_CONDR
-#define OP_COND_EXEC (OP_CONDE|OP_EXEC) // executed only if the pre-conditions are met
-#define OP_COND_SRC  (OP_CONDR|OP_SRC) // set only if pre-conditions are met
-#define OP_COND_DST  (OP_CONDW|OP_DST) // set only if pre-conditions are met
+#define OP_COND_EXEC (OP_CONDE|OP_EXEC)  // 条件成立时才执行
+#define OP_COND_SRC  (OP_CONDR|OP_SRC)   // 条件成立时才读回
+#define OP_COND_DST  (OP_CONDW|OP_DST)   // 条件成立时才写入
 #define OP_COND      (OP_CONDR|OP_CONDW)
 
-// Bits 16-31 are available for use outside of the opcode table, but they can only
-// be used in INSTRUCTION_OPERAND.Flags, they may conflit with the architecture specific
-// operands. For example, bits 16-31 are used in X86 for AMODE_* and OPTYPE_*
-#define OP_ADDRESS    (1<<16)
-#define OP_LOCAL      (1<<17)
-#define OP_PARAM      (1<<18)
-#define OP_GLOBAL     (1<<19)
-#define OP_FAR        (1<<20)
-#define OP_IPREL      (1<<21)
+// bits 16-31 可在操作码表外使用，但只限于 INSTRUCTION_OPERAND.Flags
+// 警告：这些位可能与具体体系的 AMODE_* / OPTYPE_* 冲突
+#define OP_ADDRESS    (1<<16)  // 操作数是内存地址
+#define OP_LOCAL      (1<<17)  // 操作数是局部变量
+#define OP_PARAM      (1<<18)  // 操作数是函数参数
+#define OP_GLOBAL     (1<<19)  // 操作数是全局变量
+#define OP_FAR        (1<<20)  // 远调用/远跳转（跨段）
+#define OP_IPREL      (1<<21)  // IP 相对寻址（x64 下的 RIP 相对指令）
 
-//
-// X86-specific flags (bits 27-31)
-//
-#define OP_MSR      (OP_SYS|OP_UNUSED)
+// x86 扩展操作数标志（bits 27-31）
+#define OP_MSR      (OP_SYS|OP_UNUSED)  // 模型特定寄存器（MSR）操作数
 
-//
-// Other architecture flags
-//
-#define OP_DELAY  OP_UNUSED // delayed instruction (e.g., delayed branch that executes after the next instruction)
+// 其他体系标志
+#define OP_DELAY  OP_UNUSED // 延迟执行指令（例如 MIPS 延迟分支）
 
 /////////////////////////////////////////////////////////////////////
-// Architectures
+// 支持的处理器体系类型
 /////////////////////////////////////////////////////////////////////
 
 typedef enum _ARCHITECTURE_TYPE
 {
-	ARCH_UNKNOWN=0,
+	ARCH_UNKNOWN=0,   // 未知体系
 	
-	// x86-based
-	ARCH_X86,    // 32-bit x86
-	ARCH_X86_16, // 16-bit x86
-	ARCH_X64,    // AMD64 and Intel EMD64
+	// x86 系列
+	ARCH_X86,    // 32 位 x86
+	ARCH_X86_16, // 16 位 x86
+	ARCH_X64,    // AMD64 和 Intel EM64T
 	
-	// everything else
+	// 其他体系
 	ARCH_ALPHA,
 	ARCH_ARM,
 	ARCH_DOTNET,
@@ -433,17 +430,20 @@ typedef struct _ARCHITECTURE_FORMAT_FUNCTIONS
 	FIND_FUNCTION_BY_PROLOGUE FindFunctionByPrologue;
 } ARCHITECTURE_FORMAT_FUNCTIONS;
 
+// 体系结构函数表（每个体系对应一组回调函数）
 typedef struct _ARCHITECTURE_FORMAT
 {
-	ARCHITECTURE_TYPE Type;
-	ARCHITECTURE_FORMAT_FUNCTIONS *Functions;
+	ARCHITECTURE_TYPE Type;                    // 体系类型
+	ARCHITECTURE_FORMAT_FUNCTIONS *Functions;  // 该体系对应的函数指针表
 } ARCHITECTURE_FORMAT;
 
+// 反汇编器 / 指令结构体已初始化标志
 #define DISASSEMBLER_INITIALIZED 0x1234566F
 #define INSTRUCTION_INITIALIZED 0x1234567F
 
 #include "disasm_x86.h"
 
+// 128 位有符号 / 无符号整數类型（SSE 汇编指令操作数需要 16 字节对齐）
 typedef struct DECLSPEC_ALIGN(16) _S128
 {
     U64 Low;
@@ -455,43 +455,35 @@ typedef struct DECLSPEC_ALIGN(16) _U128
     U64 High;
 } U128;
 
+// 指令操作数结构体——描述一条指令的单个操作数
 typedef struct _INSTRUCTION_OPERAND
 {
-	U32 Flags;
-	U8 Type : 6;
-	U8 Unused : 2;
-	U16 Length;
+	U32 Flags;       // 操作数标志（OP_REG、OP_SRC、OP_DST 等组合）
+	U8 Type : 6;     // 操作数类型（OPTYPE_IMM、OPTYPE_OFFSET 等）
+	U8 Unused : 2;   // 保留位
+	U16 Length;      // 操作数长度（字节）
 	
-
-	// If non-NULL, this indicates the target address of the instruction (e.g., a branch or
-	// a displacement with no base register). However, this address is only reliable if the
-	// image is mapped correctly (e.g., the executable is mapped as an image and fixups have
-	// been applied if it is not at its preferred image base).
+	// 若非 NULL，表示指令的目标地址（分支目标或无基寻址的位移）。
+	// 该地址仅在镜像正确映射时可靠（即可执行文件已按镜像映射且已应用重定位）。
 	//
-	// If disassembling a 16-bit DOS application, TargetAddress is in the context of 
-	// X86Instruction->Segment. For example, if TargetAddress is the address of a code branch, 
-	// it is in the CS segment (unless X86Instruction->HasSegmentOverridePrefix is set). If 
-	// TargetAddress is a data pointer, it is in the DS segment (unless 
-	// X86Instruction->HasSegmentOverridePrefix is set)
-	U64 TargetAddress;
-	U32 Register;
+	// 对于 16 位 DOS 应用程序，TargetAddress 基于 X86Instruction->Segment：
+	//   - 索引为代码跳转时在 CS 段中（除非有段覆盖前缀）
+	//   - 索引为数据指针时在 DS 段中（除非有段覆盖前缀）
+	U64 TargetAddress;  // 目标地址
+	U32 Register;       // 操作数对应的寄存器编号
 
 	union
 	{
-		// All 8/16/32-bit operands are extended to 64-bits automatically
-		// If you want to downcast, check whether Flags & OP_SIGNED is set
-		// Like this:
-		// U32 GetOperand32(OPERAND *Operand)
-		// {
-		//	if (Operand->Flags & OP_SIGNED) return (S32)Operand->Value_S64;
-		//	else return (U32)Operand->Value_U64;
-		//}
-		U64 Value_U64;
-		S64 Value_S64;
-		U128 Value_U128;
-		U128 Float128;
-		U8 Float80[80];
-		U8 BCD[10];
+		// 所有 8/16/32 位操作数均自动扩展到 64 位
+		// 若需取小位值，请先检查 Flags & OP_SIGNED 是否置位：
+		//   if (Operand->Flags & OP_SIGNED) return (S32)Operand->Value_S64;
+		//   else return (U32)Operand->Value_U64;
+		U64 Value_U64;    // 无符号整数值
+		S64 Value_S64;    // 有符号整数值
+		U128 Value_U128;  // 128 位整数值
+		U128 Float128;    // 128 位浮点数
+		U8 Float80[80];   // 80 位扩展精度浮点数
+		U8 BCD[10];       // BCD 编码数
 	};
 } INSTRUCTION_OPERAND;
 
@@ -571,41 +563,46 @@ typedef struct _INSTRUCTION
 	// couldn't be determined (non-constant)
 	LONG StackChange;
 
-	// Used to assist in debugging
-	// If set, the current instruction is doing something that requires special handling
-	// For example, popf can cause tracing to be disabled
+	// 调试辅助标志——如果置位，表示当前指令需要特殊处理
+	// 例如 popf 可导致单步跟踪被禁用
 
-	U8 StringAligned : 1; // internal only
-	U8 NeedsEmulation : 1; // instruction does something that re
-	U8 Repeat : 1; // instruction repeats until some condition is met (e.g., REP prefix on X86)
-	U8 ErrorOccurred : 1; // set if instruction is invalid
-	U8 AnomalyOccurred : 1; // set if instruction is anomalous
-	U8 LastInstruction : 1; // tells the iterator callback it is the last instruction
-	U8 CodeBlockFirst: 1;
-	U8 CodeBlockLast : 1;
+	U8 StringAligned : 1;     // 仅内部使用：字符串是否对齐
+	U8 NeedsEmulation : 1;    // 该指令需要仓真运行（不能直接执行）
+	U8 Repeat : 1;            // 含有重复前缀（如 x86 的 REP 前缀）
+	U8 ErrorOccurred : 1;     // 指令无效 / 解码失败
+	U8 AnomalyOccurred : 1;   // 指令异常（例如未定义行为）
+	U8 LastInstruction : 1;   // 迭代回调中用来通知这是最后一条指令
+	U8 CodeBlockFirst: 1;     // 是否是代码块中的第一条指令
+	U8 CodeBlockLast : 1;     // 是否是代码块中的最后一条指令
 } INSTRUCTION;
 
+// 反汇编器实例结构体，封装了对某一体系进行反汇编所需的全部状态
 typedef struct _DISASSEMBLER
 {
-	U32 Initialized;
-	ARCHITECTURE_TYPE ArchType;
-	ARCHITECTURE_FORMAT_FUNCTIONS *Functions;
-	INSTRUCTION Instruction;
-	U32 Stage1Count; // GetInstruction called
-	U32 Stage2Count; // Opcode fully decoded
-	U32 Stage3CountNoDecode;   // made it through all checks when DISASM_DECODE is not set
-	U32 Stage3CountWithDecode; // made it through all checks when DISASM_DECODE is set
+	U32 Initialized;                         // 初始化标志（DISASSEMBLER_INITIALIZED）
+	ARCHITECTURE_TYPE ArchType;              // 体系类型
+	ARCHITECTURE_FORMAT_FUNCTIONS *Functions; // 指向该体系函数表的指针
+	INSTRUCTION Instruction;                 // 当前正在解码的指令
+	U32 Stage1Count;         // GetInstruction 被调用次数
+	U32 Stage2Count;         // 操作码完全解码的次数
+	U32 Stage3CountNoDecode;   // 未设置 DISASM_DECODE 时通过所有检查的次数
+	U32 Stage3CountWithDecode; // 设置 DISASM_DECODE 时通过所有检查的次数
 } DISASSEMBLER;
 
-#define DISASM_DISASSEMBLE         (1<<1)
-#define DISASM_DECODE              (1<<2)
-#define DISASM_SUPPRESSERRORS      (1<<3)
-#define DISASM_SHOWFLAGS           (1<<4)
-#define DISASM_ALIGNOUTPUT         (1<<5)
+// GetInstruction() 的调用标志
+#define DISASM_DISASSEMBLE         (1<<1)  // 生成反汇编字符串表示
+#define DISASM_DECODE              (1<<2)  // 解码指令字段（填充 INSTRUCTION 结构体）
+#define DISASM_SUPPRESSERRORS      (1<<3)  // 错误不输出日志
+#define DISASM_SHOWFLAGS           (1<<4)  // 在反汇编字符串中显示标志信息
+#define DISASM_ALIGNOUTPUT         (1<<5)  // 对齐输出字符串
 #define DISASM_DISASSEMBLE_MASK (DISASM_ALIGNOUTPUT|DISASM_SHOWBYTES|DISASM_DISASSEMBLE)
 
+// 初始化反汇编器实例，指定目标体系类型
 BOOL InitDisassembler(DISASSEMBLER *Disassembler, ARCHITECTURE_TYPE Architecture);
+// 释放反汇编器占用的资源
 void CloseDisassembler(DISASSEMBLER *Disassembler);
+// 获取下一条指令，将解码结果填充到 Disassembler->Instruction 中
+// 参数：VirtualAddress —— 如果不同于内存映射地址，可将虚拟地址传入供展示
 INSTRUCTION *GetInstruction(DISASSEMBLER *Disassembler, U64 VirtualAddress, U8 *Address, U32 Flags);
 
 #ifdef __cplusplus

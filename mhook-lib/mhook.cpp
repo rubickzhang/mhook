@@ -17,6 +17,15 @@
 //LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING 
 //FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS 
 //IN THE SOFTWARE.
+//
+// mhook.cpp - Windows API 内联 Hook 核心实现
+//
+// 实现思路（Trampoline/Detour 技术）：
+//   1. 反汇编目标函数入口处足够多的字节（>= 5），确保在指令边界截断。
+//   2. 在目标函数附近（±2GB 以内）分配一段可执行内存，构建"跳板"函数：
+//      跳板 = [原始入口字节] + [跳回目标函数后续代码的跳转指令]
+//   3. 将目标函数入口处替换为跳转到 Hook 函数的指令（5 字节 jmp）。
+//   4. 卸载 Hook 时，将原始字节写回，恢复目标函数。
 
 #include <windows.h>
 #include <tlhelp32.h>
@@ -25,21 +34,25 @@
 #include "../disasm-lib/disasm.h"
 
 //=========================================================================
+// cntof(a) - 获取静态数组元素个数
 #ifndef cntof
 #define cntof(a) (sizeof(a)/sizeof(a[0]))
 #endif
 
 //=========================================================================
+// GOOD_HANDLE(a) - 判断句柄是否有效（非 INVALID_HANDLE_VALUE 且非 NULL）
 #ifndef GOOD_HANDLE
 #define GOOD_HANDLE(a) ((a!=INVALID_HANDLE_VALUE)&&(a!=NULL))
 #endif
 
 //=========================================================================
+// gle - GetLastError 的缩写宏，用于简化错误代码获取
 #ifndef gle
 #define gle GetLastError
 #endif
 
 //=========================================================================
+// ODPRINTF - 调试输出宏：仅在 Debug 配置下将格式化字符串输出到调试器
 #ifndef ODPRINTF
 
 #ifdef _DEBUG
@@ -95,56 +108,54 @@ inline void __cdecl odprintf(PCWSTR format, ...) {
 #endif //#ifndef ODPRINTF
 
 //=========================================================================
-#define MHOOKS_MAX_CODE_BYTES	32
-#define MHOOKS_MAX_RIPS			 4
+// 跳板代码区和 RIP 相对寻址修复相关常量
+#define MHOOKS_MAX_CODE_BYTES	32  // 跳板或被覆写代码区的最大字节数
+#define MHOOKS_MAX_RIPS			 4  // 每次 Hook 最多需要修复的 RIP 相对寻址指令数量
 
 //=========================================================================
-// The trampoline structure - stores every bit of info about a hook
+// 跳板结构体 —— 存储一个 Hook 所需的全部信息
 struct MHOOKS_TRAMPOLINE {
-	PBYTE	pSystemFunction;								// the original system function
-	DWORD	cbOverwrittenCode;								// number of bytes overwritten by the jump
-	PBYTE	pHookFunction;									// the hook function that we provide
-	BYTE	codeJumpToHookFunction[MHOOKS_MAX_CODE_BYTES];	// placeholder for code that jumps to the hook function
-	BYTE	codeTrampoline[MHOOKS_MAX_CODE_BYTES];			// placeholder for code that holds the first few
-															//   bytes from the system function and a jump to the remainder
-															//   in the original location
-	BYTE	codeUntouched[MHOOKS_MAX_CODE_BYTES];			// placeholder for unmodified original code
-															//   (we patch IP-relative addressing)
-	MHOOKS_TRAMPOLINE* pPrevTrampoline;						// When in the free list, thess are pointers to the prev and next entry.
-	MHOOKS_TRAMPOLINE* pNextTrampoline;						// When not in the free list, this is a pointer to the prev and next trampoline in use.
+	PBYTE	pSystemFunction;								// 原始系统函数的实际入口地址
+	DWORD	cbOverwrittenCode;								// 被跳转指令覆写的字节数
+	PBYTE	pHookFunction;									// Hook 函数的入口地址
+	BYTE	codeJumpToHookFunction[MHOOKS_MAX_CODE_BYTES];	// 跳转到 Hook 函数的中转代码区（距离 > 2GB 时使用）
+	BYTE	codeTrampoline[MHOOKS_MAX_CODE_BYTES];			// 跳板代码：存放展开的功能代码（原始入口指令 + 跳回原始函数的跳转）
+	BYTE	codeUntouched[MHOOKS_MAX_CODE_BYTES];			// 未修改的原始入口字节备份（关闭 Hook 时用于恢复）
+	MHOOKS_TRAMPOLINE* pPrevTrampoline;						// 在空闲列表中：指向上一节点。在使用中：指向前一个跳板。
+	MHOOKS_TRAMPOLINE* pNextTrampoline;						// 在空闲列表中：指向下一节点。在使用中：指向后一个跳板。
 };
 
 //=========================================================================
-// The patch data structures - store info about rip-relative instructions
-// during hook placement
+// Hook 安装期间收集的 RIP 相对寻址指令信息（仅 x64 使用）
 struct MHOOKS_RIPINFO
 {
-	DWORD	dwOffset;
-	S64		nDisplacement;
+	DWORD	dwOffset;      // 指令内需要修复的位移字段偏移量
+	S64		nDisplacement; // 原始 RIP 相对位移（相对于原始函数入口）
 };
 
+// Hook 安装期间使用的补丁辅助数据
 struct MHOOKS_PATCHDATA
 {
-	S64				nLimitUp;
-	S64				nLimitDown;
-	DWORD			nRipCnt;
-	MHOOKS_RIPINFO	rips[MHOOKS_MAX_RIPS];
+	S64				nLimitUp;   // RIP 相对寻址导致的分配上限偏移量
+	S64				nLimitDown; // RIP 相对寻址导致的分配下限偏移量
+	DWORD			nRipCnt;    // 需要修复的 RIP 指令数量
+	MHOOKS_RIPINFO	rips[MHOOKS_MAX_RIPS]; // 各个 RIP 指令的中转信息
 };
 
 //=========================================================================
-// Global vars
-static BOOL g_bVarsInitialized = FALSE;
-static CRITICAL_SECTION g_cs;
-static MHOOKS_TRAMPOLINE* g_pHooks = NULL;
-static MHOOKS_TRAMPOLINE* g_pFreeList = NULL;
-static DWORD g_nHooksInUse = 0;
-static HANDLE* g_hThreadHandles = NULL;
-static DWORD g_nThreadHandles = 0;
-#define MHOOK_JMPSIZE 5
-#define MHOOK_MINALLOCSIZE 4096
+// 全局变量
+static BOOL g_bVarsInitialized = FALSE;         // 临界区是否已初始化
+static CRITICAL_SECTION g_cs;                   // 保护 Hook 操作的临界区（防止多线程竞争）
+static MHOOKS_TRAMPOLINE* g_pHooks = NULL;      // 正在使用的跳板链表头部
+static MHOOKS_TRAMPOLINE* g_pFreeList = NULL;   // 空闲跳板内存的链表头部
+static DWORD g_nHooksInUse = 0;                 // 当前已安装的 Hook 数量
+static HANDLE* g_hThreadHandles = NULL;         // 被挂起的线程句柄数组
+static DWORD g_nThreadHandles = 0;              // 被挂起的线程数量
+#define MHOOK_JMPSIZE 5         // 相对 jmp 指令的最小字节数（x86/x64 均为 5）
+#define MHOOK_MINALLOCSIZE 4096 // 每次分配跳板内存的最小粒度（一页大小）
 
 //=========================================================================
-// Toolhelp defintions so the functions can be dynamically bound to
+// Toolhelp 函数指针类型定义，用于运行时动态绑定，避免在旧系统上的链接问题
 typedef HANDLE (WINAPI * _CreateToolhelp32Snapshot)(
 	DWORD dwFlags,	   
 	DWORD th32ProcessID  
@@ -161,7 +172,7 @@ typedef BOOL (WINAPI * _Thread32Next)(
 									  );
 
 //=========================================================================
-// Bring in the toolhelp functions from kernel32
+// 从 kernel32.dll 中动态获取线程枚举函数（用于挂起/恢复其他线程）
 _CreateToolhelp32Snapshot fnCreateToolhelp32Snapshot = (_CreateToolhelp32Snapshot) GetProcAddress(GetModuleHandle(L"kernel32"), "CreateToolhelp32Snapshot");
 _Thread32First fnThread32First = (_Thread32First) GetProcAddress(GetModuleHandle(L"kernel32"), "Thread32First");
 _Thread32Next fnThread32Next = (_Thread32Next) GetProcAddress(GetModuleHandle(L"kernel32"), "Thread32Next");
@@ -378,53 +389,55 @@ ret             ; 返回调用者
 
 */
 
-
 //=========================================================================
-// Internal function:
-// 
-// Skip over jumps that lead to the real function. Gets around import
-// jump tables, etc.
+// 内部函数：SkipJumps
+//
+// 功能：跳过目标地址处的跳转存根（import 跳转表、热补丁跳板等），
+//       返回实际的函数入口地址。
+//
+// 具体处理的指令序列（仅 x86/x64 平台）：
+// [仅 x86]
+//   0x8B 0xFF               : mov edi, edi——Windows 热补丁占位符，直接跳过
+//   0x55 0x8B 0xEC 0x5D     : push ebp; mov ebp, esp; pop ebp——MSVC 折叠栈帧，直接跳过
+// [x86 和 x64 均适用]
+//   0xFF 0x25 [4 字节]       : jmp [addr32]（x86）或 jmp [rip+off32]（x64间接绝对跳）
+//   0x48 0xFF 0x25 [4 字节]  : REX.W jmp [rip+off32]（x64 带 REX 前缀版本）
+//   0xE9 [4 字节]            : jmp rel32——32 位相对跳转，目标 = pbCode+5+off32
+//   0xEB [1 字节]            : jmp rel8——8 位短跳转，目标 = pbCode+2+off8（有符号）
 //=========================================================================
 static PBYTE SkipJumps(PBYTE pbCode) {
 	PBYTE pbOrgCode = pbCode;
 #ifdef _M_IX86_X64
 #ifdef _M_IX86
-	//mov edi,edi: hot patch point
+	// mov edi, edi：Windows 热补丁占位符（2 字节 NOP 等效），跳过
 	if (pbCode[0] == 0x8b && pbCode[1] == 0xff)
 		pbCode += 2;
-	// push ebp; mov ebp, esp; pop ebp;
-	// "collapsed" stackframe generated by MSVC
+	// push ebp; mov ebp, esp; pop ebp：MSVC "折叠"栈帧，跳过 4 字节
 	if (pbCode[0] == 0x55 && pbCode[1] == 0x8b && pbCode[2] == 0xec && pbCode[3] == 0x5d)
 		pbCode += 4;
 #endif	
 	if (pbCode[0] == 0xff && pbCode[1] == 0x25) {
 #ifdef _M_IX86
-		// on x86 we have an absolute pointer...
+		// x86：后跟一个 32 位绝对地址（指向真实目标地址的指针所在地址）
 		PBYTE pbTarget = *(PBYTE *)&pbCode[2];
-		// ... that shows us an absolute pointer.
+		// 读取该地址处的内容，得到真实目标地址，继续递归
 		return SkipJumps(*(PBYTE *)pbTarget);
 #elif defined _M_X64
-		// on x64 we have a 32-bit offset...
+		// x64：后跟 32 位 RIP 相对偏移，*(rip+6+offset32) 才是真实目标
 		INT32 lOffset = *(INT32 *)&pbCode[2];
-		// ... that shows us an absolute pointer
 		return SkipJumps(*(PBYTE*)(pbCode + 6 + lOffset));
 	} else if (pbCode[0] == 0x48 && pbCode[1] == 0xff && pbCode[2] == 0x25) {
-		// or we can have the same with a REX prefix
+		// x64 带 REX 前缀（0x48）版本：指令长 7 字节，*(rip+7+offset32) 是真实目标
 		INT32 lOffset = *(INT32 *)&pbCode[3];
-		// ... that shows us an absolute pointer
 		return SkipJumps(*(PBYTE*)(pbCode + 7 + lOffset));
 #endif
 	} else if (pbCode[0] == 0xe9) {
-		// here the behavior is identical, we have...
-		// ...a 32-bit offset to the destination.
-		/*
-		检查当前指令是否是 jmp 指令（操作码为 0xe9）。
-        如果是，则读取 32 位的偏移量，并计算跳转目标地址。
-        递归调用 SkipJumps 函数，跳转到目标地址，继续解析。
-		*/
+		// 0xE9：32 位相对跳转（jmp rel32），指令长 5 字节
+		// 目标 = 当前指令地址 + 5 + 有符号 32 位偏移量
 		return SkipJumps(pbCode + 5 + *(INT32 *)&pbCode[1]);
 	} else if (pbCode[0] == 0xeb) {
-		// and finally an 8-bit offset to the destination
+		// 0xEB：8 位短跳转（jmp rel8），指令长 2 字节
+		// 目标 = 当前指令地址 + 2 + 有符号 8 位偏移量
 		return SkipJumps(pbCode + 2 + *(CHAR *)&pbCode[1]);
 	}
 #else
@@ -434,11 +447,12 @@ static PBYTE SkipJumps(PBYTE pbCode) {
 }
 
 //=========================================================================
-// Internal function:
+// 内部函数：EmitJump
 //
-// Writes code at pbCode that jumps to pbJumpTo. Will attempt to do this
-// in as few bytes as possible. Important on x64 where the long jump
-// (0xff 0x25 ....) can take up 14 bytes.
+// 在 pbCode 处写入跳转到 pbJumpTo 的机器码，尽量使用最少字节：
+//   - 若两者距离 <= 0x7fff0000（约 ±2GB）：写入 5 字节相对跳转 (0xE9 + 4 字节偏移)
+//   - 否则：写入 14 字节（x64）或 6 字节（x86）的间接绝对跳转 (0xFF 0x25 + 地址)
+// 返回写入完成后的下一个可用代码地址。
 //=========================================================================
 static PBYTE EmitJump(PBYTE pbCode, PBYTE pbJumpTo) {
 #ifdef _M_IX86_X64
@@ -446,6 +460,7 @@ static PBYTE EmitJump(PBYTE pbCode, PBYTE pbJumpTo) {
 	SIZE_T cbDiff = pbJumpFrom > pbJumpTo ? pbJumpFrom - pbJumpTo : pbJumpTo - pbJumpFrom;
 	ODPRINTF((L"mhooks: EmitJump: Jumping from %p to %p, diff is %p", pbJumpFrom, pbJumpTo, cbDiff));
 	if (cbDiff <= 0x7fff0000) {
+		// 使用 5 字节相对跳转（0xE9 + 32 位有符号偏移）
 		pbCode[0] = 0xe9;
 		pbCode += 1;
 		*((PDWORD)pbCode) = (DWORD)(DWORD_PTR)(pbJumpTo - pbJumpFrom);
@@ -473,9 +488,8 @@ static PBYTE EmitJump(PBYTE pbCode, PBYTE pbJumpTo) {
 
 
 //=========================================================================
-// Internal function:
-//
-// Round down to the next multiple of rndDown
+// 内部函数：RoundDown
+// 将地址 addr 向下取整为 rndDown 的整数倍
 //=========================================================================
 static size_t RoundDown(size_t addr, size_t rndDown)
 {
@@ -483,30 +497,31 @@ static size_t RoundDown(size_t addr, size_t rndDown)
 }
 
 //=========================================================================
-// Internal function:
+// 内部函数：BlockAlloc
 //
-// Will attempt allocate a block of memory within the specified range, as 
-// near as possible to the specified function.
+// 在 [pbLower, pbUpper) 范围内、尽可能靠近 pSystemFunction 的位置，
+// 以螺旋搜索策略批量分配一页可执行内存，并将其切分为多个跳板槽位链接
+// 到全局空闲链表；分配失败时返回 NULL。
 //=========================================================================
 static MHOOKS_TRAMPOLINE* BlockAlloc(PBYTE pSystemFunction, PBYTE pbLower, PBYTE pbUpper) {
 	SYSTEM_INFO sSysInfo =  {0};
 	::GetSystemInfo(&sSysInfo);
 
-	// Always allocate in bulk, in case the system actually has a smaller allocation granularity than MINALLOCSIZE.
+	// 批量分配时使用系统分配粒度与 MHOOK_MINALLOCSIZE 中的较大值，以节省 VirtualAlloc 调用次数
 	const ptrdiff_t cAllocSize = max(sSysInfo.dwAllocationGranularity, MHOOK_MINALLOCSIZE);
 
 	MHOOKS_TRAMPOLINE* pRetVal = NULL;
 	PBYTE pModuleGuess = (PBYTE) RoundDown((size_t)pSystemFunction, cAllocSize);
 	int loopCount = 0;
 	for (PBYTE pbAlloc = pModuleGuess; pbLower < pbAlloc && pbAlloc < pbUpper; ++loopCount) {
-		// determine current state
+		// 查询目标地址的内存状态
 		MEMORY_BASIC_INFORMATION mbi;
 		ODPRINTF((L"mhooks: BlockAlloc: Looking at address %p", pbAlloc));
 		if (!VirtualQuery(pbAlloc, &mbi, sizeof(mbi)))
 			break;
-		// free & large enough?
+		// 仅在空闲且足够大的内存区域尝试分配
 		if (mbi.State == MEM_FREE && mbi.RegionSize >= (unsigned)cAllocSize) {
-			// and then try to allocate it
+			// 尝试在此地址分配可执行读写内存
 			pRetVal = (MHOOKS_TRAMPOLINE*) VirtualAlloc(pbAlloc, cAllocSize, MEM_COMMIT|MEM_RESERVE, PAGE_EXECUTE_READWRITE);
 			if (pRetVal) {
 				size_t trampolineCount = cAllocSize / sizeof(MHOOKS_TRAMPOLINE);
@@ -536,16 +551,17 @@ static MHOOKS_TRAMPOLINE* BlockAlloc(PBYTE pSystemFunction, PBYTE pbLower, PBYTE
 }
 
 //=========================================================================
-// Internal function:
+// 内部函数：FindTrampolineInRange
 //
-// Will try to allocate a big block of memory inside the required range. 
+// 在空闲跳板链表（g_pFreeList）中查找地址位于 [pLower, pUpper) 之间的跳板，
+// 找到后从空闲链表中移除并返回；未找到则返回 NULL。
 //=========================================================================
 static MHOOKS_TRAMPOLINE* FindTrampolineInRange(PBYTE pLower, PBYTE pUpper) {
 	if (!g_pFreeList) {
 		return NULL;
 	}
 
-	// This is a standard free list, except we're doubly linked to deal with soem return shenanigans.
+	// 标准空闲链表搜索，使用双向链表以便安全移除节点
 	MHOOKS_TRAMPOLINE* curEntry = g_pFreeList;
 	while (curEntry) {
 		if ((MHOOKS_TRAMPOLINE*) pLower < curEntry && curEntry < (MHOOKS_TRAMPOLINE*) pUpper) {
@@ -561,37 +577,30 @@ static MHOOKS_TRAMPOLINE* FindTrampolineInRange(PBYTE pLower, PBYTE pUpper) {
 }
 
 /*
-在确定分配位置的上下界时，加上偏移 0x7ff80000 是为了确保分配的内存
-块在目标函数附近的合理范围内。这个偏移量的选择是为了在目标函数的上
-下 2GB 范围内找到一个合适的内存块，以便跳板（trampoline）能够正常工作。
-
-具体来说，x86 和 x64 架构中的相对跳转指令（如 jmp 和 call）有一个范围
-限制，通常是 ±2GB。为了确保跳板能够在这个范围内进行跳转，需要在目标
-函数的上下 2GB 范围内分配内存。
-
-pLower 和 pUpper 分别表示分配位置的下界和上界。
-pLower 的计算：如果 pSystemFunction + nLimitUp 小于 0x0000000080000000，
-则将 pLower 设置为 0x1，否则减去 0x7fff0000。
-pUpper 的计算：如果 pSystemFunction + nLimitDown 小于 0xffffffff80000000，
-则将 pUpper 加上 0x7ff80000，否则设置为 0xfffffffffff80000。
-这些计算确保了分配位置在目标函数的上下 2GB 范围内，从而使跳板能够正常工作。
-具体来说，0x7ff80000 是一个接近 2GB 的值，用于调整分配位置的范围，以确保跳
-板能够在目标函数附近找到合适的内存块。
-0x7ff80000 = 1024 * 1024 * 2047  -> 2G
-*/
-//=========================================================================
-// Internal function:
+// 分配跳板内存时上下界的计算说明：
 //
-// Will try to allocate the trampoline structure within 2 gigabytes of
-// the target function. 
+// x86/x64 的相对跳转指令（jmp rel32）范围限制为 ±2GB。
+// pLower / pUpper 是允许分配跳板的地址范围，基于以下规则计算：
+//
+//   pLower = pSystemFunction + nLimitUp（考虑 RIP 相对指令的最大负向偏移）
+//            调整为 (pLower - 0x7fff0000) 以留出 ~2GB 的空间
+//            若溢出地址空间下界则截断为 0x1
+//   pUpper = pSystemFunction + nLimitDown（考虑 RIP 相对指令的最大正向偏移）
+//            调整为 (pUpper + 0x7ff80000) 以留出 ~2GB 的空间
+//            若溢出地址空间上界则截断为 0xfffffffffff80000
+//
+// 0x7ff80000 ≈ 2047 MB ≈ 2GB，确保跳板在目标函数的 ±2GB RIP 可达范围内。
+//=========================================================================
+// 内部函数：TrampolineAlloc
+//
+// 在目标函数附近（±2GB 内）分配一个跳板结构体槽位。
+// 若已有符合条件的空闲槽位，直接复用；否则调用 BlockAlloc 新分配内存页。
 //=========================================================================
 static MHOOKS_TRAMPOLINE* TrampolineAlloc(PBYTE pSystemFunction, S64 nLimitUp, S64 nLimitDown) {
 
 	MHOOKS_TRAMPOLINE* pTrampoline = NULL;
 
-	// determine lower and upper bounds for the allocation locations.
-	// in the basic scenario this is +/- 2GB but IP-relative instructions
-	// found in the original code may require a smaller window.
+	// 计算可分配地址的下界和上界（基本情况是 ±2GB，有 RIP 相对指令时范围更小）
 	PBYTE pLower = pSystemFunction + nLimitUp;
 	pLower = pLower < (PBYTE)(DWORD_PTR)0x0000000080000000 ? 
 						(PBYTE)(0x1) : (PBYTE)(pLower - (PBYTE)0x7fff0000);
@@ -600,16 +609,15 @@ static MHOOKS_TRAMPOLINE* TrampolineAlloc(PBYTE pSystemFunction, S64 nLimitUp, S
 		(PBYTE)(pUpper + (DWORD_PTR)0x7ff80000) : (PBYTE)(DWORD_PTR)0xfffffffffff80000;
 	ODPRINTF((L"mhooks: TrampolineAlloc: Allocating for %p between %p and %p", pSystemFunction, pLower, pUpper));
 
-	// try to find a trampoline in the specified range
+	// 优先在空闲链表中查找满足地址范围要求的跳板槽位
 	pTrampoline = FindTrampolineInRange(pLower, pUpper);
 	if (!pTrampoline) {
-		// if it we can't find it, then we need to allocate a new block and 
-		// try again. Just fail if that doesn't work 
+		// 空闲链表中没有合适的，尝试向系统申请新的内存块并再次查找
 		g_pFreeList = BlockAlloc(pSystemFunction, pLower, pUpper);
 		pTrampoline = FindTrampolineInRange(pLower, pUpper);
 	}
 
-	// found and allocated a trampoline?
+	// 成功分配后插入正在使用的跳板链表头部
 	if (pTrampoline) {
 		ListPrepend(&g_pHooks, pTrampoline);
 	}
@@ -618,9 +626,9 @@ static MHOOKS_TRAMPOLINE* TrampolineAlloc(PBYTE pSystemFunction, S64 nLimitUp, S
 }
 
 //=========================================================================
-// Internal function:
-//
-// Return the internal trampoline structure that belongs to a hooked function.
+// 内部函数：TrampolineGet
+// 在已安装 Hook 的跳板链表（g_pHooks）中查找 Hook 函数地址为 pHookedFunction
+// 的跳板节点，未找到返回 NULL。
 //=========================================================================
 static MHOOKS_TRAMPOLINE* TrampolineGet(PBYTE pHookedFunction) {
 	MHOOKS_TRAMPOLINE* pCurrent = g_pHooks;
@@ -656,19 +664,20 @@ static VOID TrampolineFree(MHOOKS_TRAMPOLINE* pTrampoline, BOOL bNeverUsed) {
 }
 
 //=========================================================================
-// Internal function:
+// 内部函数：SuspendOneThread
 //
-// Suspend a given thread and try to make sure that its instruction
-// pointer is not in the given range.
+// 挂起指定线程，并确保其指令指针（IP/RIP）不在即将被修改的代码范围内。
+// 若 IP 正位于要覆写的区域，最多重试 3 次（每次等待 100ms）；
+// 若 3 次后 IP 仍在范围内，则放弃并关闭句柄（返回 NULL）。
 //=========================================================================
 static HANDLE SuspendOneThread(DWORD dwThreadId, PBYTE pbCode, DWORD cbBytes) {
-	// open the thread
+	// 以最高访问权限打开线程
 	HANDLE hThread = OpenThread(THREAD_ALL_ACCESS, FALSE, dwThreadId);
 	if (GOOD_HANDLE(hThread)) {
-		// attempt suspension
+		// 挂起线程
 		DWORD dwSuspendCount = SuspendThread(hThread);
 		if (dwSuspendCount != -1) {
-			// see where the IP is
+			// 检查线程当前的指令指针位置
 			CONTEXT ctx;
 			ctx.ContextFlags = CONTEXT_CONTROL;
 			int nTries = 0;
@@ -680,16 +689,14 @@ static HANDLE SuspendOneThread(DWORD dwThreadId, PBYTE pbCode, DWORD cbBytes) {
 #endif
 				if (pIp >= pbCode && pIp < (pbCode + cbBytes)) {
 					if (nTries < 3) {
-						// oops - we should try to get the instruction pointer out of here. 
+						// IP 在要覆写的区域内，恢复线程等待其执行出该区域，然后再次挂起
 						ODPRINTF((L"mhooks: SuspendOneThread: suspended thread %d - IP is at %p - IS COLLIDING WITH CODE", dwThreadId, pIp));
 						ResumeThread(hThread);
 						Sleep(100);
 						SuspendThread(hThread);
 						nTries++;
 					} else {
-						// we gave it all we could. (this will probably never 
-						// happen - unless the thread has already been suspended 
-						// to begin with)
+						// 3 次重试后 IP 仍在冲突区域（通常不会发生，除非线程已经被其他代码挂起）
 						ODPRINTF((L"mhooks: SuspendOneThread: suspended thread %d - IP is at %p - IS COLLIDING WITH CODE - CAN'T FIX", dwThreadId, pIp));
 						ResumeThread(hThread);
 						CloseHandle(hThread);
@@ -712,21 +719,19 @@ static HANDLE SuspendOneThread(DWORD dwThreadId, PBYTE pbCode, DWORD cbBytes) {
 }
 
 //=========================================================================
-// Internal function:
-//
-// Resumes all previously suspended threads in the current process.
+// 内部函数：ResumeOtherThreads
+// 恢复之前挂起的所有线程，并关闭其句柄。操作期间临时提升当前线程优先级。
 //=========================================================================
 static VOID ResumeOtherThreads() {
-	// make sure things go as fast as possible
+	// 提升优先级以便尽快完成恢复操作
 	INT nOriginalPriority = GetThreadPriority(GetCurrentThread());
 	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
-	// go through our list
+	// 遍历挂起的线程列表，逐一恢复并关闭句柄
 	for (DWORD i=0; i<g_nThreadHandles; i++) {
-		// and resume & close thread handles
 		ResumeThread(g_hThreadHandles[i]);
 		CloseHandle(g_hThreadHandles[i]);
 	}
-	// clean up
+	// 释放句柄数组
 	free(g_hThreadHandles);
 	g_hThreadHandles = NULL;
 	g_nThreadHandles = 0;
@@ -734,22 +739,22 @@ static VOID ResumeOtherThreads() {
 }
 
 //=========================================================================
-// Internal function:
+// 内部函数：SuspendOtherThreads
 //
-// Suspend all threads in this process while trying to make sure that their 
-// instruction pointer is not in the given range.
+// 挂起当前进程中所有其他线程，确保它们的 IP 不在即将被修改的代码区域内。
+// 操作期间临时提升当前线程优先级，以减少窗口期。
 //=========================================================================
 static BOOL SuspendOtherThreads(PBYTE pbCode, DWORD cbBytes) {
 	BOOL bRet = FALSE;
-	// make sure we're the most important thread in the process
+	// 提升优先级，减少其他线程在此期间被调度的可能性
 	INT nOriginalPriority = GetThreadPriority(GetCurrentThread());
 	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
-	// get a view of the threads in the system
+	// 获取当前进程中所有线程的快照
 	HANDLE hSnap = fnCreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, GetCurrentProcessId());
 	if (GOOD_HANDLE(hSnap)) {
 		THREADENTRY32 te;
 		te.dwSize = sizeof(te);
-		// count threads in this process (except for ourselves)
+		// 统计当前进程中除自身外的线程数量
 		DWORD nThreadsInProcess = 0;
 		if (fnThread32First(hSnap, &te)) {
 			do {
@@ -821,8 +826,10 @@ static BOOL SuspendOtherThreads(PBYTE pbCode, DWORD cbBytes) {
 static void FixupIPRelativeAddressing(PBYTE pbNew, PBYTE pbOriginal, MHOOKS_PATCHDATA* pdata)
 {
 #if defined _M_X64
+	// 计算跳板代码相对于原始代码的偏移差值
 	S64 diff = pbNew - pbOriginal;
 	for (DWORD i = 0; i < pdata->nRipCnt; i++) {
+		// 将原始位移减去偏移差，使 RIP 相对指令在跳板新位置上仍能访问正确地址
 		DWORD dwNewDisplacement = (DWORD)(pdata->rips[i].nDisplacement - diff);
 		ODPRINTF((L"mhooks: fixing up RIP instruction operand for code at 0x%p: "
 			L"old displacement: 0x%8.8x, new displacement: 0x%8.8x", 
@@ -833,47 +840,22 @@ static void FixupIPRelativeAddressing(PBYTE pbNew, PBYTE pbOriginal, MHOOKS_PATC
 	}
 #endif
 }
-/*
-author: rubickzhang
-description:
-DisassembleAndSkip函数的主要功能是对目标函数的机器码进行反汇编，并跳过一定长度的指令，
-以确保始终在指令边界上结束。它还会检测分支和子程序调用（以及返回），
-在这些点上停止反汇编。最后，它会检测并收集可以修补的IP相对指令的信息。
-
-以下是DisassembleAndSkip函数的具体逻辑：
-
-初始化反汇编器并设置架构类型（x86或x64）。
-使用GetInstruction函数逐条获取目标函数的指令。
-对每条指令进行处理：
-如果指令类型是返回、分支或调用，则停止反汇编。
-对于x64架构，处理RIP相对寻址的指令，计算相对位移并存储相关信息。
-累加指令长度，直到达到指定的最小长度dwMinLen。
-关闭反汇编器并返回累加的指令长度。
-
-
-DISASM_DECODE：
-
-含义：指示反汇编器应解析并解码指令。
-作用：反汇编器将读取内存中的字节并将其转换为对应的指令结构。
-DISASM_DISASSEMBLE：
-
-含义：指示反汇编器应生成指令的反汇编字符串表示。
-作用：反汇编器将生成一段可读的汇编代码字符串，表示解码后的指令。
-DISASM_ALIGNOUTPUT：
-
-含义：指示反汇编器应对输出进行对齐。
-作用：反汇编器将对生成的反汇编字符串进行对齐，以便更易读和调试。
-
-*/
-
 
 //=========================================================================
-// Examine the machine code at the target function's entry point, and
-// skip bytes in a way that we'll always end on an instruction boundary.
-// We also detect branches and subroutine calls (as well as returns)
-// at which point disassembly must stop.
-// Finally, detect and collect information on IP-relative instructions
-// that we can patch.
+// 内部函数：DisassembleAndSkip
+//
+// 从 pFunction 处开始反汇编，跳过至少 dwMinLen 字节（确保始终在指令边界结束）。
+// 遇到以下情况时立即停止：RET / 无条件或条件分支 / 调用指令。
+// 对于 x64 下的 RIP 相对寻址指令（mov/lea reg, [rip+imm32]），
+// 记录其位移信息到 pdata，以便后续在跳板中修复地址。
+//
+// 参数：
+//   pFunction - 待反汇编的函数/代码起始地址
+//   dwMinLen  - 最少需要覆盖的字节数
+//   pdata     - 输出：RIP 相对寻址修复信息及分配范围限制
+// 返回值：
+//   成功跳过的字节总数（>= dwMinLen 时才足以安全安装 Hook）
+//=========================================================================
 static DWORD DisassembleAndSkip(PVOID pFunction, DWORD dwMinLen, MHOOKS_PATCHDATA* pdata) {
 	DWORD dwRet = 0;
 	pdata->nLimitDown = 0;
@@ -890,6 +872,7 @@ static DWORD DisassembleAndSkip(PVOID pFunction, DWORD dwMinLen, MHOOKS_PATCHDAT
 	if (InitDisassembler(&dis, arch)) {
 		INSTRUCTION* pins = NULL;
 		U8* pLoc = (U8*)pFunction;
+		// 启用解码 + 生成反汇编字符串 + 对齐输出（便于调试输出）
 		DWORD dwFlags = DISASM_DECODE | DISASM_DISASSEMBLE | DISASM_ALIGNOUTPUT;
 
 		ODPRINTF((L"mhooks: DisassembleAndSkip: Disassembling %p", pLoc));
@@ -983,13 +966,26 @@ static DWORD DisassembleAndSkip(PVOID pFunction, DWORD dwMinLen, MHOOKS_PATCHDAT
 }
 
 //=========================================================================
+// Mhook_SetHook - 为指定系统函数安装内联 Hook
+//
+// 执行步骤：
+//   1. 通过 SkipJumps 找到真实函数入口（越过导入跳转表/热补丁存根）
+//   2. 使用 DisassembleAndSkip 确定需要覆写的字节数（>= 5）
+//   3. 挂起当前进程中所有其他线程，防止多线程竞态
+//   4. 在目标函数附近分配跳板内存（TrampolineAlloc）
+//   5. 将原始入口字节复制到跳板，并在其后追加跳回原始函数后续代码的跳转
+//   6. 修复跳板中的 RIP 相对寻址指令（x64）
+//   7. 将目标函数入口写入跳转到 Hook 函数的指令
+//   8. 更新 *ppSystemFunction 指向跳板，供调用方调用原始逻辑
+//   9. 恢复被挂起的其他线程
+//=========================================================================
 BOOL Mhook_SetHook(PVOID *ppSystemFunction, PVOID pHookFunction) {
 	MHOOKS_TRAMPOLINE* pTrampoline = NULL;
 	PVOID pSystemFunction = *ppSystemFunction;
-	// ensure thread-safety
+	// 进入临界区，保证线程安全
 	EnterCritSec();
 	ODPRINTF((L"mhooks: Mhook_SetHook: Started on the job: %p / %p", pSystemFunction, pHookFunction));
-	// find the real functions (jump over jump tables, if any)
+	// 跳过导入跳转表等存根，找到真实的函数入口地址
 	pSystemFunction = SkipJumps((PBYTE)pSystemFunction);
 	pHookFunction   = SkipJumps((PBYTE)pHookFunction);
 	ODPRINTF((L"mhooks: Mhook_SetHook: Started on the job: %p / %p", pSystemFunction, pHookFunction));
@@ -1075,17 +1071,16 @@ BOOL Mhook_SetHook(PVOID *ppSystemFunction, PVOID pHookFunction) {
 				ODPRINTF((L"mhooks: Mhook_SetHook: failed VirtualProtect 1: %d", gle()));
 			}
 			if (pTrampoline->pSystemFunction) {
-				// this is what the application will use as the entry point
-				// to the "original" unhooked function.
+				// Hook 成功：将 *ppSystemFunction 指向跳板，供调用方调用原始逻辑
 				*ppSystemFunction = pTrampoline->codeTrampoline;
 				ODPRINTF((L"mhooks: Mhook_SetHook: Hooked the function!"));
 			} else {
-				// if we failed discard the trampoline (forcing VirtualFree)
+				// Hook 失败：丢弃跳板（强制释放内存）
 				TrampolineFree(pTrampoline, TRUE);
 				pTrampoline = NULL;
 			}
 		}
-		// resume everybody else
+		// 恢复被挂起的其他线程
 		ResumeOtherThreads();
 	} else {
 		ODPRINTF((L"mhooks: disassembly signals %d bytes (unacceptable)", dwInstructionLength));
@@ -1095,11 +1090,22 @@ BOOL Mhook_SetHook(PVOID *ppSystemFunction, PVOID pHookFunction) {
 }
 
 //=========================================================================
+// Mhook_Unhook - 卸载已安装的 Hook，恢复原始函数行为
+//
+// 执行步骤：
+//   1. 查找与 *ppHookedFunction（跳板地址）对应的跳板结构
+//   2. 挂起其他线程，防止并发访问被修改的代码区
+//   3. 将原始入口字节从 codeUntouched 写回目标函数起始处
+//   4. 刷新指令缓存，恢复内存保护属性
+//   5. 将 *ppHookedFunction 还原为原始函数地址
+//   6. 释放（归还）跳板槽位到空闲链表（内存不真正释放，防止崩溃）
+//   7. 恢复其他线程
+//=========================================================================
 BOOL Mhook_Unhook(PVOID *ppHookedFunction) {
 	ODPRINTF((L"mhooks: Mhook_Unhook: %p", *ppHookedFunction));
 	BOOL bRet = FALSE;
 	EnterCritSec();
-	// get the trampoline structure that corresponds to our function
+	// 根据跳板中存储的 Hook 函数地址查找跳板结构体
 	MHOOKS_TRAMPOLINE* pTrampoline = TrampolineGet((PBYTE)*ppHookedFunction);
 	if (pTrampoline) {
 		// make sure nobody's executing code where we're about to overwrite a few bytes
